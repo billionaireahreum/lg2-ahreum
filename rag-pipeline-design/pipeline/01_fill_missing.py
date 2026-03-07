@@ -1,19 +1,21 @@
 """
-결측치 보완 파이프라인
+결측치 보완 파이프라인 (TMDB API 버전)
 
 대상:
-  - vod.director: NULL 313건 → Claude 추론 (제목+장르+제공사 기반)
-  - vod.smry:     NULL  28건 → Claude 생성 (제목+장르+감독+주연 기반)
+  - vod.director: NULL 313건 → TMDB에서 감독명 검색
+  - vod.smry:     NULL  28건 → TMDB에서 줄거리 검색
 
 실행:
+  set TMDB_API_KEY=your_api_key
   python pipeline/01_fill_missing.py
 
 멱등성: rag_processed=FALSE 조건으로 재실행 안전
 """
 import logging
 import sys
+import time
 
-import anthropic
+import requests
 
 import config
 from db import fetch_all_as_dict, get_conn
@@ -25,51 +27,74 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+TMDB_BASE = "https://api.themoviedb.org/3"
+SESSION = requests.Session()
+SESSION.params = {"api_key": config.TMDB_API_KEY, "language": "ko-KR"}
 
 
 # ---------------------------------------------------------------------------
-# 프롬프트 빌더
+# TMDB 검색 헬퍼
 # ---------------------------------------------------------------------------
 
-def _prompt_director(vod: dict) -> str:
-    return f"""다음 VOD 정보를 바탕으로 감독명을 추론해주세요.
-정확히 알 수 없으면 반드시 UNKNOWN 이라고만 반환하세요.
-
-제목: {vod.get('asset_nm', '')}
-분류: {vod.get('ct_cl', '')}
-장르: {vod.get('genre', '')} / {vod.get('genre_detail', '')}
-제공사: {vod.get('provider', '')}
-방영일: {vod.get('release_date', '')}
-
-감독명만 반환 (예: 봉준호 또는 UNKNOWN):"""
-
-
-def _prompt_smry(vod: dict) -> str:
-    director_line = f"\n감독: {vod['director']}" if vod.get('director') else ""
-    cast_line     = f"\n주연: {vod['cast_lead']}" if vod.get('cast_lead') else ""
-    return f"""다음 VOD 정보를 바탕으로 2~3문장의 한국어 줄거리를 작성해주세요.
-정보가 너무 부족해 작성이 불가능하면 반드시 UNKNOWN 이라고만 반환하세요.
-
-제목: {vod.get('asset_nm', '')}
-분류: {vod.get('ct_cl', '')}
-장르: {vod.get('genre', '')} / {vod.get('genre_detail', '')}{director_line}{cast_line}
-방영일: {vod.get('release_date', '')}
-
-2~3문장 한국어 줄거리 (또는 UNKNOWN):"""
+def _search_tmdb(title: str, is_movie: bool) -> dict | None:
+    """제목으로 TMDB 검색 → 첫 번째 결과 반환"""
+    endpoint = "movie" if is_movie else "tv"
+    try:
+        resp = SESSION.get(
+            f"{TMDB_BASE}/search/{endpoint}",
+            params={"query": title},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+        return results[0] if results else None
+    except Exception:
+        return None
 
 
-# ---------------------------------------------------------------------------
-# Claude 호출
-# ---------------------------------------------------------------------------
+def _get_credits(tmdb_id: int, is_movie: bool) -> dict:
+    """TMDB credits 조회 (감독, 주연)"""
+    endpoint = "movie" if is_movie else "tv"
+    try:
+        resp = SESSION.get(
+            f"{TMDB_BASE}/{endpoint}/{tmdb_id}/credits",
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:
+        return {}
 
-def _call_claude(prompt: str, max_tokens: int) -> str:
-    message = client.messages.create(
-        model=config.CLAUDE_MODEL,
-        max_tokens=max_tokens,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return message.content[0].text.strip()
+
+def _find_director(credits: dict) -> str | None:
+    """credits에서 감독명 추출"""
+    for member in credits.get("crew", []):
+        if member.get("job") == "Director":
+            return member.get("name")
+    # TV의 경우 created_by에서 찾기
+    for person in credits.get("created_by", []):
+        return person.get("name")
+    return None
+
+
+def _search_vod(vod: dict) -> tuple[dict | None, bool]:
+    """VOD 정보로 TMDB 검색 → (결과, is_movie)"""
+    title = vod.get("asset_nm", "")
+    ct_cl = vod.get("ct_cl", "")
+
+    is_movie = "영화" in ct_cl
+
+    # 1차: ct_cl 기반으로 검색
+    result = _search_tmdb(title, is_movie)
+    if result:
+        return result, is_movie
+
+    # 2차: 반대 타입으로 재검색
+    result = _search_tmdb(title, not is_movie)
+    if result:
+        return result, not is_movie
+
+    return None, is_movie
 
 
 # ---------------------------------------------------------------------------
@@ -98,8 +123,13 @@ def process_missing_directors():
 
     for i, vod in enumerate(vods, 1):
         try:
-            raw = _call_claude(_prompt_director(vod), max_tokens=64)
-            director = None if raw.upper() == "UNKNOWN" else raw
+            result, is_movie = _search_vod(vod)
+            director = None
+
+            if result:
+                tmdb_id = result.get("id")
+                credits = _get_credits(tmdb_id, is_movie)
+                director = _find_director(credits)
 
             with get_conn() as conn:
                 with conn.cursor() as cur:
@@ -107,15 +137,17 @@ def process_missing_directors():
                         UPDATE vod
                         SET director         = %s,
                             rag_processed    = TRUE,
-                            rag_source       = 'CLAUDE_INFERENCE',
+                            rag_source       = 'TMDB',
                             rag_processed_at = NOW()
                         WHERE full_asset_id = %s
-                    """, (director, vod['full_asset_id']))
+                    """, (director, vod["full_asset_id"]))
 
             if director:
                 success += 1
             else:
                 skipped += 1
+
+            time.sleep(0.25)  # TMDB 레이트 리밋 (40req/10s)
 
         except Exception as e:
             failed += 1
@@ -124,7 +156,7 @@ def process_missing_directors():
         if i % 50 == 0:
             logger.info(f"  진행: {i}/{len(vods)} (성공:{success}, 스킵:{skipped}, 실패:{failed})")
 
-    logger.info(f"director 처리 완료 — 성공:{success}, UNKNOWN:{skipped}, 오류:{failed}")
+    logger.info(f"director 처리 완료 — 성공:{success}, 미발견:{skipped}, 오류:{failed}")
 
 
 # ---------------------------------------------------------------------------
@@ -153,8 +185,13 @@ def process_missing_smry():
 
     for i, vod in enumerate(vods, 1):
         try:
-            raw = _call_claude(_prompt_smry(vod), max_tokens=256)
-            smry = None if raw.upper() == "UNKNOWN" else raw
+            result, _ = _search_vod(vod)
+            smry = None
+
+            if result:
+                smry = result.get("overview") or None
+                if smry and len(smry.strip()) < 10:
+                    smry = None  # 너무 짧은 줄거리 무시
 
             with get_conn() as conn:
                 with conn.cursor() as cur:
@@ -162,15 +199,17 @@ def process_missing_smry():
                         UPDATE vod
                         SET smry             = %s,
                             rag_processed    = TRUE,
-                            rag_source       = 'CLAUDE_GENERATED',
+                            rag_source       = 'TMDB',
                             rag_processed_at = NOW()
                         WHERE full_asset_id = %s
-                    """, (smry, vod['full_asset_id']))
+                    """, (smry, vod["full_asset_id"]))
 
             if smry:
                 success += 1
             else:
                 skipped += 1
+
+            time.sleep(0.25)
 
         except Exception as e:
             failed += 1
@@ -179,7 +218,7 @@ def process_missing_smry():
         if i % 10 == 0:
             logger.info(f"  진행: {i}/{len(vods)} (성공:{success}, 스킵:{skipped}, 실패:{failed})")
 
-    logger.info(f"smry 처리 완료 — 성공:{success}, UNKNOWN:{skipped}, 오류:{failed}")
+    logger.info(f"smry 처리 완료 — 성공:{success}, 미발견:{skipped}, 오류:{failed}")
 
 
 # ---------------------------------------------------------------------------
@@ -212,11 +251,12 @@ def print_summary():
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    if not config.ANTHROPIC_API_KEY:
-        logger.error("ANTHROPIC_API_KEY 환경변수가 설정되지 않았습니다.")
+    if not config.TMDB_API_KEY:
+        logger.error("TMDB_API_KEY 환경변수가 설정되지 않았습니다.")
+        logger.error("set TMDB_API_KEY=your_api_key")
         sys.exit(1)
 
-    logger.info("=== 결측치 보완 파이프라인 시작 ===")
+    logger.info("=== 결측치 보완 파이프라인 시작 (TMDB) ===")
     process_missing_directors()
     process_missing_smry()
     print_summary()

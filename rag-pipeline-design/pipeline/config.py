@@ -14,7 +14,10 @@ DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 
 # Claude API
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-CLAUDE_MODEL      = "claude-haiku-4-5-20251001"   # 빠름 + 저렴
+CLAUDE_MODEL      = "claude-haiku-4-5-20251001"
+
+# TMDB API (무료)
+TMDB_API_KEY = os.getenv("TMDB_API_KEY", "")
 
 # 임베딩 모델 (로컬, 무료, 한국어 지원)
 EMBEDDING_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
