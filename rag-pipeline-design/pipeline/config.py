@@ -19,6 +19,14 @@ CLAUDE_MODEL      = "claude-haiku-4-5-20251001"
 # TMDB API (무료)
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "")
 
+# Naver 검색 API
+NAVER_CLIENT_ID     = os.getenv("NAVER_CLIENT_ID", "")
+NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET", "")
+
+# Ollama (로컬 LLM - TMDB 실패 시 폴백)
+OLLAMA_HOST  = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+
 # 임베딩 모델 (로컬, 무료, 한국어 지원)
 EMBEDDING_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
 EMBEDDING_DIM   = 384
