@@ -167,14 +167,19 @@ def _get_release_dates(tmdb_id: int, is_movie: bool) -> dict:
 
 
 def _extract_cast_lead(credits: dict, max_cast: int = 3) -> str | None:
-    """주연 배우 최대 3명 추출 → '홍길동, 김철수, 이영희'"""
+    """billing order 상위 3명 추출 (대표 출연진) → '홍길동, 김철수, 이영희'"""
     cast = credits.get("cast", [])
     names = [c["name"] for c in cast[:max_cast] if c.get("name")]
     return ", ".join(names) if names else None
 
 
 def _extract_cast_guest(credits: dict, skip: int = 3, max_cast: int = 5) -> str | None:
-    """조연 배우 4~8번째 추출 → '홍길동, 김철수, ...'"""
+    """추가 출연진 최대 5명 추출 (billing order 4~8위).
+
+    주의: TMDB episode-level guest_stars와 다른 개념.
+    시리즈/영화 레벨에서 대표 출연진 외 후순위 주요 배우를 저장하는 메타보강용 필드.
+    실제 '게스트 출연자'가 아닌 'additional/supporting cast' 의미로 사용.
+    """
     cast = credits.get("cast", [])
     names = [c["name"] for c in cast[skip:skip + max_cast] if c.get("name")]
     return ", ".join(names) if names else None
