@@ -48,6 +48,26 @@ _SEARCH_CACHE: dict = {}
 _CREDITS_CACHE: dict = {}
 _RATING_CACHE: dict = {}
 
+# 실제 API 호출 횟수 및 캐시 히트 카운터
+_API_CALL_COUNT: int = 0
+_SEARCH_CACHE_HIT: int = 0
+_CREDITS_CACHE_HIT: int = 0
+_RATING_CACHE_HIT: int = 0
+
+
+# ---------------------------------------------------------------------------
+# TMDB API 공통 래퍼 (실제 호출 시에만 sleep + 카운트)
+# ---------------------------------------------------------------------------
+
+def _tmdb_get(url: str, **kwargs) -> requests.Response:
+    """TMDB API 호출 래퍼. 실제 요청 시에만 레이트 리밋 대기 및 카운트."""
+    global _API_CALL_COUNT
+    resp = SESSION.get(url, timeout=10, **kwargs)
+    _API_CALL_COUNT += 1
+    resp.raise_for_status()
+    time.sleep(0.26)  # 실제 API 호출 직후만 대기 (캐시 히트 시 스킵)
+    return resp
+
 
 # ---------------------------------------------------------------------------
 # 제목 정규화
@@ -83,21 +103,22 @@ def _normalize_title(title: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _search_tmdb(title: str, is_movie: bool) -> dict | None:
+    global _SEARCH_CACHE_HIT
+
     endpoint = "movie" if is_movie else "tv"
     compact_query = re.sub(r"\s+", "", title.lower())
     cache_key = (endpoint, compact_query)
 
     if cache_key in _SEARCH_CACHE:
+        _SEARCH_CACHE_HIT += 1
         return _SEARCH_CACHE[cache_key]
 
     result = None
     try:
-        resp = SESSION.get(
+        resp = _tmdb_get(
             f"{TMDB_BASE}/search/{endpoint}",
             params={"query": title},
-            timeout=10,
         )
-        resp.raise_for_status()
         results = resp.json().get("results", [])
 
         if results:
@@ -152,15 +173,17 @@ def _search_vod(vod: dict) -> tuple[dict | None, bool]:
 
 
 def _get_credits(tmdb_id: int, is_movie: bool) -> dict:
+    global _CREDITS_CACHE_HIT
+
     endpoint = "movie" if is_movie else "tv"
     cache_key = (endpoint, tmdb_id)
 
     if cache_key in _CREDITS_CACHE:
+        _CREDITS_CACHE_HIT += 1
         return _CREDITS_CACHE[cache_key]
 
     try:
-        resp = SESSION.get(f"{TMDB_BASE}/{endpoint}/{tmdb_id}/credits", timeout=10)
-        resp.raise_for_status()
+        resp = _tmdb_get(f"{TMDB_BASE}/{endpoint}/{tmdb_id}/credits")
         data = resp.json()
     except Exception:
         data = {}
@@ -171,19 +194,19 @@ def _get_credits(tmdb_id: int, is_movie: bool) -> dict:
 
 def _get_release_dates(tmdb_id: int, is_movie: bool) -> dict:
     """한국 시청등급 조회"""
+    global _RATING_CACHE_HIT
+
     endpoint = "movie" if is_movie else "tv"
     cache_key = (endpoint, tmdb_id)
 
     if cache_key in _RATING_CACHE:
+        _RATING_CACHE_HIT += 1
         return _RATING_CACHE[cache_key]
 
     data = {}
     try:
         if is_movie:
-            resp = SESSION.get(
-                f"{TMDB_BASE}/movie/{tmdb_id}/release_dates", timeout=10
-            )
-            resp.raise_for_status()
+            resp = _tmdb_get(f"{TMDB_BASE}/movie/{tmdb_id}/release_dates")
             for entry in resp.json().get("results", []):
                 if entry.get("iso_3166_1") == "KR":
                     for r in entry.get("release_dates", []):
@@ -191,10 +214,7 @@ def _get_release_dates(tmdb_id: int, is_movie: bool) -> dict:
                             data = {"rating": r["certification"]}
                             break
         else:
-            resp = SESSION.get(
-                f"{TMDB_BASE}/tv/{tmdb_id}/content_ratings", timeout=10
-            )
-            resp.raise_for_status()
+            resp = _tmdb_get(f"{TMDB_BASE}/tv/{tmdb_id}/content_ratings")
             for entry in resp.json().get("results", []):
                 if entry.get("iso_3166_1") == "KR":
                     data = {"rating": entry.get("rating", "")}
@@ -275,7 +295,6 @@ def run():
     total_rating = 0
     total_date = 0
     total_not_found = 0
-    total_cache_hits = 0
 
     logger.info("=== cast_lead / cast_guest / rating / release_date 보완 시작 (캐싱 버전) ===")
 
@@ -289,13 +308,7 @@ def run():
 
         for i, vod in enumerate(vods, 1):
             try:
-                # 캐시 히트 여부 확인 (search 함수 호출 전 캐시 크기 스냅샷)
-                cache_size_before = len(_SEARCH_CACHE)
-
                 result, is_movie = _search_vod(vod)
-
-                # search 캐시가 늘지 않았으면 캐시 히트
-                is_cache_hit = len(_SEARCH_CACHE) == cache_size_before
 
                 cast_lead = None
                 cast_guest = None
@@ -322,17 +335,16 @@ def run():
                 update_vod(vod["full_asset_id"], cast_lead, cast_guest, rating, release_date)
                 total_processed += 1
 
-                if is_cache_hit:
-                    total_cache_hits += 1
-                else:
-                    time.sleep(0.26)  # 실제 API 호출 시에만 레이트 리밋 대기
-
                 if i % 100 == 0:
                     logger.info(
                         f"  [{i}/{len(vods)}] 누적:{total_processed} "
                         f"cast:{total_cast} guest:{total_guest} "
                         f"rating:{total_rating} date:{total_date} "
-                        f"미발견:{total_not_found} 캐시히트:{total_cache_hits}"
+                        f"미발견:{total_not_found} | "
+                        f"api호출:{_API_CALL_COUNT} "
+                        f"search캐시:{_SEARCH_CACHE_HIT} "
+                        f"credits캐시:{_CREDITS_CACHE_HIT} "
+                        f"rating캐시:{_RATING_CACHE_HIT}"
                     )
 
             except Exception as e:
@@ -340,7 +352,9 @@ def run():
 
         logger.info(
             f"  누적 결과 → cast:{total_cast} / rating:{total_rating} "
-            f"/ date:{total_date} / TMDB미발견:{total_not_found} / 캐시히트:{total_cache_hits}"
+            f"/ date:{total_date} / TMDB미발견:{total_not_found} | "
+            f"api호출:{_API_CALL_COUNT} / search캐시:{_SEARCH_CACHE_HIT} "
+            f"/ credits캐시:{_CREDITS_CACHE_HIT} / rating캐시:{_RATING_CACHE_HIT}"
         )
 
     logger.info("=== 완료 ===")
@@ -350,7 +364,10 @@ def run():
     logger.info(f"  rating 채움   : {total_rating:,}건")
     logger.info(f"  release_date  : {total_date:,}건")
     logger.info(f"  TMDB 미발견   : {total_not_found:,}건")
-    logger.info(f"  캐시 히트(절약): {total_cache_hits:,}건")
+    logger.info(f"  실제 API 호출 : {_API_CALL_COUNT:,}건")
+    logger.info(f"  search 캐시히트: {_SEARCH_CACHE_HIT:,}건")
+    logger.info(f"  credits캐시히트: {_CREDITS_CACHE_HIT:,}건")
+    logger.info(f"  rating 캐시히트: {_RATING_CACHE_HIT:,}건")
 
 
 if __name__ == "__main__":
