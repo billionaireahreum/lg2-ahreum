@@ -83,7 +83,26 @@ def _search_tmdb(title: str, is_movie: bool) -> dict | None:
         )
         resp.raise_for_status()
         results = resp.json().get("results", [])
-        return results[0] if results else None
+        if not results:
+            return None
+
+        compact_query = re.sub(r"\s+", "", title.lower())
+
+        # 1차: 완전 일치
+        for r in results[:5]:
+            cand = (r.get("title") if is_movie else r.get("name") or "").strip()
+            if re.sub(r"\s+", "", cand.lower()) == compact_query:
+                return r
+
+        # 2차: 포함 관계
+        for r in results[:5]:
+            cand = (r.get("title") if is_movie else r.get("name") or "").strip()
+            compact_cand = re.sub(r"\s+", "", cand.lower())
+            if compact_query in compact_cand or compact_cand in compact_query:
+                return r
+
+        # 3차: 첫 번째 결과 폴백
+        return results[0]
     except Exception:
         return None
 
