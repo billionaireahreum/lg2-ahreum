@@ -1,5 +1,6 @@
 # Phase 3 TMDB 메타데이터 보완 파이프라인 진행 보고서
 
+**작업 일시**: 2026-03-09 17:01 ~ 23:59
 **작성일**: 2026-03-09
 **브랜치**: `rag-pipeline-design`
 **파일**: `pipeline/03_fill_cast_rating_date.py`
