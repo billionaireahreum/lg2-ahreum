@@ -256,36 +256,34 @@ def _extract_release_date(result: dict, is_movie: bool) -> str | None:
 # 메인 처리
 # ---------------------------------------------------------------------------
 
-def fetch_unprocessed(batch_size: int = 500) -> list[dict]:
+def fetch_unprocessed(conn, batch_size: int = 500) -> list[dict]:
     """아직 TMDB 조회 안 한 VOD 조회 (tmdb_checked_at IS NULL)
     영화/드라마/애니메이션 우선 처리 (TMDB 매칭 가능성 높음)
     """
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT full_asset_id, asset_nm, ct_cl
-                FROM vod
-                WHERE tmdb_checked_at IS NULL
-                  AND is_active = TRUE
-                  AND ct_cl IN ('영화', 'TV드라마', 'TV애니메이션')
-                ORDER BY ct_cl, full_asset_id
-                LIMIT %s
-            """, (batch_size,))
-            return fetch_all_as_dict(cur)
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT full_asset_id, asset_nm, ct_cl
+            FROM vod
+            WHERE tmdb_checked_at IS NULL
+              AND is_active = TRUE
+              AND ct_cl IN ('영화', 'TV드라마', 'TV애니메이션')
+            ORDER BY ct_cl, full_asset_id
+            LIMIT %s
+        """, (batch_size,))
+        return fetch_all_as_dict(cur)
 
 
-def update_vod(full_asset_id: str, cast_lead, cast_guest, rating, release_date):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                UPDATE vod
-                SET cast_lead        = %s,
-                    cast_guest       = %s,
-                    rating           = %s,
-                    release_date     = %s::date,
-                    tmdb_checked_at  = NOW()
-                WHERE full_asset_id = %s
-            """, (cast_lead, cast_guest, rating, release_date, full_asset_id))
+def update_vod(cur, full_asset_id: str, cast_lead, cast_guest, rating, release_date):
+    """단일 커서로 UPDATE. 커밋은 호출자(run)에서 배치 단위로 처리."""
+    cur.execute("""
+        UPDATE vod
+        SET cast_lead        = %s,
+            cast_guest       = %s,
+            rating           = %s,
+            release_date     = %s::date,
+            tmdb_checked_at  = NOW()
+        WHERE full_asset_id = %s
+    """, (cast_lead, cast_guest, rating, release_date, full_asset_id))
 
 
 def run():
@@ -299,63 +297,69 @@ def run():
     logger.info("=== cast_lead / cast_guest / rating / release_date 보완 시작 (캐싱 버전) ===")
 
     BATCH = 500
-    while True:
-        vods = fetch_unprocessed(BATCH)
-        if not vods:
-            break
+    with get_conn() as conn:  # 배치 전체 동안 커넥션 1개 재사용
+        while True:
+            conn.commit()  # 새 배치 fetch 전 이전 트랜잭션 커밋 (tmdb_checked_at 반영)
+            vods = fetch_unprocessed(conn, BATCH)
+            if not vods:
+                break
 
-        logger.info(f"처리 배치: {len(vods)}건 (누적: {total_processed}건)")
+            logger.info(f"처리 배치: {len(vods)}건 (누적: {total_processed}건)")
 
-        for i, vod in enumerate(vods, 1):
-            try:
-                result, is_movie = _search_vod(vod)
+            with conn.cursor() as cur:
+                for i, vod in enumerate(vods, 1):
+                    try:
+                        result, is_movie = _search_vod(vod)
 
-                cast_lead = None
-                cast_guest = None
-                rating = None
-                release_date = None
+                        cast_lead = None
+                        cast_guest = None
+                        rating = None
+                        release_date = None
 
-                if result:
-                    tmdb_id = result.get("id")
-                    credits = _get_credits(tmdb_id, is_movie)
-                    rating_data = _get_release_dates(tmdb_id, is_movie)
+                        if result:
+                            tmdb_id = result.get("id")
+                            credits = _get_credits(tmdb_id, is_movie)
+                            rating_data = _get_release_dates(tmdb_id, is_movie)
 
-                    cast_lead    = _extract_cast_lead(credits)
-                    cast_guest   = _extract_cast_guest(credits)
-                    rating       = rating_data.get("rating") or None
-                    release_date = _extract_release_date(result, is_movie)
+                            cast_lead    = _extract_cast_lead(credits)
+                            cast_guest   = _extract_cast_guest(credits)
+                            rating       = rating_data.get("rating") or None
+                            release_date = _extract_release_date(result, is_movie)
 
-                    if cast_lead:    total_cast   += 1
-                    if cast_guest:   total_guest  += 1
-                    if rating:       total_rating += 1
-                    if release_date: total_date   += 1
-                else:
-                    total_not_found += 1
+                            if cast_lead:    total_cast   += 1
+                            if cast_guest:   total_guest  += 1
+                            if rating:       total_rating += 1
+                            if release_date: total_date   += 1
+                        else:
+                            total_not_found += 1
 
-                update_vod(vod["full_asset_id"], cast_lead, cast_guest, rating, release_date)
-                total_processed += 1
+                        update_vod(cur, vod["full_asset_id"], cast_lead, cast_guest, rating, release_date)
+                        total_processed += 1
 
-                if i % 100 == 0:
-                    logger.info(
-                        f"  [{i}/{len(vods)}] 누적:{total_processed} "
-                        f"cast:{total_cast} guest:{total_guest} "
-                        f"rating:{total_rating} date:{total_date} "
-                        f"미발견:{total_not_found} | "
-                        f"api호출:{_API_CALL_COUNT} "
-                        f"search캐시:{_SEARCH_CACHE_HIT} "
-                        f"credits캐시:{_CREDITS_CACHE_HIT} "
-                        f"rating캐시:{_RATING_CACHE_HIT}"
-                    )
+                        if i % 100 == 0:
+                            conn.commit()  # 100건마다 중간 커밋 (장애 시 손실 최소화)
+                            logger.info(
+                                f"  [{i}/{len(vods)}] 누적:{total_processed} "
+                                f"cast:{total_cast} guest:{total_guest} "
+                                f"rating:{total_rating} date:{total_date} "
+                                f"미발견:{total_not_found} | "
+                                f"api호출:{_API_CALL_COUNT} "
+                                f"search캐시:{_SEARCH_CACHE_HIT}({len(_SEARCH_CACHE)}) "
+                                f"credits캐시:{_CREDITS_CACHE_HIT}({len(_CREDITS_CACHE)}) "
+                                f"rating캐시:{_RATING_CACHE_HIT}({len(_RATING_CACHE)})"
+                            )
 
-            except Exception as e:
-                logger.error(f"[오류] {vod['full_asset_id']} ({vod['asset_nm']}): {e}")
+                    except Exception as e:
+                        logger.error(f"[오류] {vod['full_asset_id']} ({vod['asset_nm']}): {e}")
 
-        logger.info(
-            f"  누적 결과 → cast:{total_cast} / rating:{total_rating} "
-            f"/ date:{total_date} / TMDB미발견:{total_not_found} | "
-            f"api호출:{_API_CALL_COUNT} / search캐시:{_SEARCH_CACHE_HIT} "
-            f"/ credits캐시:{_CREDITS_CACHE_HIT} / rating캐시:{_RATING_CACHE_HIT}"
-        )
+                conn.commit()  # 배치 끝 나머지 커밋
+
+            logger.info(
+                f"  누적 결과 → cast:{total_cast} / rating:{total_rating} "
+                f"/ date:{total_date} / TMDB미발견:{total_not_found} | "
+                f"api호출:{_API_CALL_COUNT} / search캐시:{_SEARCH_CACHE_HIT} "
+                f"/ credits캐시:{_CREDITS_CACHE_HIT} / rating캐시:{_RATING_CACHE_HIT}"
+            )
 
     logger.info("=== 완료 ===")
     logger.info(f"  전체 처리    : {total_processed:,}건")
@@ -364,7 +368,7 @@ def run():
     logger.info(f"  rating 채움   : {total_rating:,}건")
     logger.info(f"  release_date  : {total_date:,}건")
     logger.info(f"  TMDB 미발견   : {total_not_found:,}건")
-    logger.info(f"  실제 API 호출 : {_API_CALL_COUNT:,}건")
+    logger.info(f"  실제 API 요청 : {_API_CALL_COUNT:,}건")
     logger.info(f"  search 캐시히트: {_SEARCH_CACHE_HIT:,}건")
     logger.info(f"  credits캐시히트: {_CREDITS_CACHE_HIT:,}건")
     logger.info(f"  rating 캐시히트: {_RATING_CACHE_HIT:,}건")
