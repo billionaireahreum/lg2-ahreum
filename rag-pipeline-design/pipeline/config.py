@@ -3,6 +3,9 @@ RAG 파이프라인 설정
 환경변수로 오버라이드 가능
 """
 import os
+from dotenv import load_dotenv
+
+load_dotenv()  # pipeline/.env 자동 로드
 
 
 # DB 연결
