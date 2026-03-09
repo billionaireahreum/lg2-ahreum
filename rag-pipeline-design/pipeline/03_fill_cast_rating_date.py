@@ -39,6 +39,15 @@ TMDB_BASE = "https://api.themoviedb.org/3"
 SESSION = requests.Session()
 SESSION.params = {"api_key": config.TMDB_API_KEY, "language": "ko-KR"}
 
+# ---------------------------------------------------------------------------
+# 인메모리 캐시 (같은 작품 회차 반복 호출 방지)
+# key: (endpoint, compact_title) → search 결과
+# key: (endpoint, tmdb_id)       → credits / rating 결과
+# ---------------------------------------------------------------------------
+_SEARCH_CACHE: dict = {}
+_CREDITS_CACHE: dict = {}
+_RATING_CACHE: dict = {}
+
 
 # ---------------------------------------------------------------------------
 # 제목 정규화
@@ -75,6 +84,13 @@ def _normalize_title(title: str) -> str:
 
 def _search_tmdb(title: str, is_movie: bool) -> dict | None:
     endpoint = "movie" if is_movie else "tv"
+    compact_query = re.sub(r"\s+", "", title.lower())
+    cache_key = (endpoint, compact_query)
+
+    if cache_key in _SEARCH_CACHE:
+        return _SEARCH_CACHE[cache_key]
+
+    result = None
     try:
         resp = SESSION.get(
             f"{TMDB_BASE}/search/{endpoint}",
@@ -83,28 +99,33 @@ def _search_tmdb(title: str, is_movie: bool) -> dict | None:
         )
         resp.raise_for_status()
         results = resp.json().get("results", [])
-        if not results:
-            return None
 
-        compact_query = re.sub(r"\s+", "", title.lower())
+        if results:
+            # 1차: 완전 일치
+            for r in results[:5]:
+                cand = (r.get("title") if is_movie else r.get("name") or "").strip()
+                if re.sub(r"\s+", "", cand.lower()) == compact_query:
+                    result = r
+                    break
 
-        # 1차: 완전 일치
-        for r in results[:5]:
-            cand = (r.get("title") if is_movie else r.get("name") or "").strip()
-            if re.sub(r"\s+", "", cand.lower()) == compact_query:
-                return r
+            # 2차: 포함 관계
+            if result is None:
+                for r in results[:5]:
+                    cand = (r.get("title") if is_movie else r.get("name") or "").strip()
+                    compact_cand = re.sub(r"\s+", "", cand.lower())
+                    if compact_query in compact_cand or compact_cand in compact_query:
+                        result = r
+                        break
 
-        # 2차: 포함 관계
-        for r in results[:5]:
-            cand = (r.get("title") if is_movie else r.get("name") or "").strip()
-            compact_cand = re.sub(r"\s+", "", cand.lower())
-            if compact_query in compact_cand or compact_cand in compact_query:
-                return r
+            # 3차: 첫 번째 결과 폴백
+            if result is None:
+                result = results[0]
 
-        # 3차: 첫 번째 결과 폴백
-        return results[0]
     except Exception:
-        return None
+        pass
+
+    _SEARCH_CACHE[cache_key] = result  # None도 캐싱 (재검색 방지)
+    return result
 
 
 def _search_vod(vod: dict) -> tuple[dict | None, bool]:
@@ -132,16 +153,31 @@ def _search_vod(vod: dict) -> tuple[dict | None, bool]:
 
 def _get_credits(tmdb_id: int, is_movie: bool) -> dict:
     endpoint = "movie" if is_movie else "tv"
+    cache_key = (endpoint, tmdb_id)
+
+    if cache_key in _CREDITS_CACHE:
+        return _CREDITS_CACHE[cache_key]
+
     try:
         resp = SESSION.get(f"{TMDB_BASE}/{endpoint}/{tmdb_id}/credits", timeout=10)
         resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
     except Exception:
-        return {}
+        data = {}
+
+    _CREDITS_CACHE[cache_key] = data
+    return data
 
 
 def _get_release_dates(tmdb_id: int, is_movie: bool) -> dict:
     """한국 시청등급 조회"""
+    endpoint = "movie" if is_movie else "tv"
+    cache_key = (endpoint, tmdb_id)
+
+    if cache_key in _RATING_CACHE:
+        return _RATING_CACHE[cache_key]
+
+    data = {}
     try:
         if is_movie:
             resp = SESSION.get(
@@ -152,7 +188,8 @@ def _get_release_dates(tmdb_id: int, is_movie: bool) -> dict:
                 if entry.get("iso_3166_1") == "KR":
                     for r in entry.get("release_dates", []):
                         if r.get("certification"):
-                            return {"rating": r["certification"]}
+                            data = {"rating": r["certification"]}
+                            break
         else:
             resp = SESSION.get(
                 f"{TMDB_BASE}/tv/{tmdb_id}/content_ratings", timeout=10
@@ -160,10 +197,13 @@ def _get_release_dates(tmdb_id: int, is_movie: bool) -> dict:
             resp.raise_for_status()
             for entry in resp.json().get("results", []):
                 if entry.get("iso_3166_1") == "KR":
-                    return {"rating": entry.get("rating", "")}
+                    data = {"rating": entry.get("rating", "")}
+                    break
     except Exception:
         pass
-    return {}
+
+    _RATING_CACHE[cache_key] = data
+    return data
 
 
 def _extract_cast_lead(credits: dict, max_cast: int = 3) -> str | None:
@@ -235,8 +275,9 @@ def run():
     total_rating = 0
     total_date = 0
     total_not_found = 0
+    total_cache_hits = 0
 
-    logger.info("=== cast_lead / cast_guest / rating / release_date 보완 시작 ===")
+    logger.info("=== cast_lead / cast_guest / rating / release_date 보완 시작 (캐싱 버전) ===")
 
     BATCH = 500
     while True:
@@ -248,7 +289,13 @@ def run():
 
         for i, vod in enumerate(vods, 1):
             try:
+                # 캐시 히트 여부 확인 (search 함수 호출 전 캐시 크기 스냅샷)
+                cache_size_before = len(_SEARCH_CACHE)
+
                 result, is_movie = _search_vod(vod)
+
+                # search 캐시가 늘지 않았으면 캐시 히트
+                is_cache_hit = len(_SEARCH_CACHE) == cache_size_before
 
                 cast_lead = None
                 cast_guest = None
@@ -274,14 +321,18 @@ def run():
 
                 update_vod(vod["full_asset_id"], cast_lead, cast_guest, rating, release_date)
                 total_processed += 1
-                time.sleep(0.26)  # TMDB 레이트 리밋 (40req/10s)
+
+                if is_cache_hit:
+                    total_cache_hits += 1
+                else:
+                    time.sleep(0.26)  # 실제 API 호출 시에만 레이트 리밋 대기
 
                 if i % 100 == 0:
                     logger.info(
                         f"  [{i}/{len(vods)}] 누적:{total_processed} "
                         f"cast:{total_cast} guest:{total_guest} "
                         f"rating:{total_rating} date:{total_date} "
-                        f"미발견:{total_not_found}"
+                        f"미발견:{total_not_found} 캐시히트:{total_cache_hits}"
                     )
 
             except Exception as e:
@@ -289,7 +340,7 @@ def run():
 
         logger.info(
             f"  누적 결과 → cast:{total_cast} / rating:{total_rating} "
-            f"/ date:{total_date} / TMDB미발견:{total_not_found}"
+            f"/ date:{total_date} / TMDB미발견:{total_not_found} / 캐시히트:{total_cache_hits}"
         )
 
     logger.info("=== 완료 ===")
@@ -299,6 +350,7 @@ def run():
     logger.info(f"  rating 채움   : {total_rating:,}건")
     logger.info(f"  release_date  : {total_date:,}건")
     logger.info(f"  TMDB 미발견   : {total_not_found:,}건")
+    logger.info(f"  캐시 히트(절약): {total_cache_hits:,}건")
 
 
 if __name__ == "__main__":
