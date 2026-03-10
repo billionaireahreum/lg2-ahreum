@@ -1,20 +1,7 @@
-# Claude Code - 로컬 설정만 제외 (agents/commands/report는 팀 공유)
-.claude/settings.local.json
-.progress/
-
-# Python cache
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
-
-# Environment
 .env
-*.env
-
-# Virtual environments
-venv/
-.venv/
-
-# OS
+*.egg-info/
 .DS_Store
-Thumbs.db
+.claude/settings.local.json
