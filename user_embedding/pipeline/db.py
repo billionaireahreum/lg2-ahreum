@@ -42,7 +42,7 @@ def get_conn():
         conn.close()
 
 
-def fetch_all_as_dict(cur):
+def fetch_all_as_dict(cur) -> list[dict]:
     """커서 결과를 dict 리스트로 변환"""
     cols = [desc[0] for desc in cur.description]
     return [dict(zip(cols, row)) for row in cur.fetchall()]
