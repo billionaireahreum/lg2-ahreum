@@ -22,6 +22,9 @@ CLAUDE_MODEL      = "claude-haiku-4-5-20251001"
 # TMDB API (무료)
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "")
 
+# KMDB API (한국영화데이터베이스)
+KMDB_SERVICE_KEY = os.getenv("KMDB_SERVICE_KEY", "")
+
 # 임베딩 모델 (로컬, 무료, 한국어 지원)
 EMBEDDING_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
 EMBEDDING_DIM   = 384
