@@ -23,6 +23,23 @@ master (보호 브랜치 - 직접 push 금지)
 - 새 브랜치 시작: `/new-branch` 커맨드 실행
 - 작업 완료: `/done` 커맨드 실행
 
+### 브랜치 폴더 격리 규칙 (필수)
+
+- 각 브랜치는 **자기 담당 폴더만** 포함
+- master는 전체 폴더 포함 (모든 브랜치 merge 결과)
+- 새 브랜치 생성 시 다른 폴더가 딸려오면 **즉시 제거 후 push**
+- 다른 브랜치 폴더 건드리는 것 **절대 금지**
+
+| 브랜치 | 포함 폴더 |
+|--------|----------|
+| `database-design` | `database-design/` |
+| `rag-pipeline-design` | `rag-pipeline-design/` |
+| `embedding-design` | `user_embedding/` |
+| `phase3-mf-engine` | `phase3-mf-engine/` |
+| `phase4-llm-api` | `phase4-llm-api/` |
+| `phase5-streamlit-ui` | `phase5-streamlit-ui/` |
+| `phase6-yolo-marketplace` | `phase6-yolo-marketplace/` |
+
 ---
 
 ## 2. DB 접근 권한
