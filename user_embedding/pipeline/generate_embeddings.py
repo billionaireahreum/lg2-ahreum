@@ -5,6 +5,7 @@ VOD 콘텐츠 임베딩 재생성 파이프라인 (시리즈 단위, v2)
   - 시리즈 단위 처리: normalized_title + ct_cl 기준으로 그룹핑
   - 임베딩 1회 연산 → 시리즈 내 전체 row에 동일 벡터 복사 (중복 연산 방지)
   - 입력 텍스트에 cast_guest, release_date 추가
+  - 배치 인코딩 적용 (인코딩 속도 개선)
 
 입력 텍스트 구성:
   제목 / 유형 / 장르 / 세부장르 / 감독: xxx / 주연: xxx / 조연: xxx / 줄거리 / 개봉연도
@@ -20,8 +21,8 @@ VOD 콘텐츠 임베딩 재생성 파이프라인 (시리즈 단위, v2)
 """
 import logging
 import re
-import sys
 from collections import defaultdict
+from datetime import date
 
 import numpy as np
 import psycopg2.extras
@@ -37,6 +38,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# 배치 인코딩 크기 (시리즈 단위, 메모리에 따라 조정)
+ENCODE_BATCH_SIZE = 128
+
 
 # ---------------------------------------------------------------------------
 # 제목 정규화 (03번 파이프라인과 동일 로직)
@@ -48,6 +52,8 @@ def normalize_title(title: str) -> str:
     에피소드 번호·화질·자막 표기 등을 제거해 동일 콘텐츠로 묶는다.
 
     예) '겨울왕국 [4K]', '겨울왕국 (더빙)', '겨울왕국 1회' → '겨울왕국'
+
+    정규화 결과가 빈 문자열이 되면 원본 반환 (제목 자체가 괄호인 특수 케이스 방어).
     """
     if not title:
         return ''
@@ -57,7 +63,8 @@ def normalize_title(title: str) -> str:
     t = re.sub(r'\s*\d+회\b', '', t)
     t = re.sub(r'\s*시즌\s*\d+', '', t)
     t = re.sub(r'\s*EP\d+', '', t, flags=re.IGNORECASE)
-    return t.strip()
+    # 정규화 결과가 빈 문자열이면 원본 반환
+    return t.strip() or title.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -71,11 +78,11 @@ def build_vod_text(vod: dict) -> str:
     포함 필드: 제목 / 유형 / 장르 / 세부장르 / 감독 / 주연 / 조연 / 줄거리 / 개봉연도
     rating은 필터링 전용이므로 임베딩 텍스트에서 제외.
     """
-    parts: list[str] = [
-        vod.get('asset_nm', ''),
-        vod.get('ct_cl', ''),
-        vod.get('genre', ''),
-        vod.get('genre_detail', ''),
+    parts = [
+        vod.get('asset_nm') or '',
+        vod.get('ct_cl') or '',
+        vod.get('genre') or '',
+        vod.get('genre_detail') or '',
     ]
     if vod.get('director'):
         parts.append(f"감독: {vod['director']}")
@@ -86,8 +93,9 @@ def build_vod_text(vod: dict) -> str:
     if vod.get('smry'):
         parts.append(vod['smry'])
     if vod.get('release_date'):
-        # 연도만 추출해서 추가 (날짜 전체는 노이즈)
-        year = str(vod['release_date'])[:4]
+        # datetime.date 객체와 문자열 모두 안전하게 처리
+        rd = vod['release_date']
+        year = str(rd.year) if isinstance(rd, date) else str(rd)[:4]
         parts.append(year)
     return ' '.join(filter(None, parts))
 
@@ -102,7 +110,7 @@ def _completeness_score(vod: dict) -> int:
     return sum(1 for f in fields if vod.get(f))
 
 
-def pick_representative(vods: list[dict]) -> dict:
+def pick_representative(vods: list) -> dict:
     """시리즈 내 대표 row 선택: 메타데이터 완성도 기준"""
     return max(vods, key=_completeness_score)
 
@@ -111,7 +119,7 @@ def pick_representative(vods: list[dict]) -> dict:
 # 전체 VOD 조회
 # ---------------------------------------------------------------------------
 
-def fetch_all_vods() -> list[dict]:
+def fetch_all_vods() -> list:
     """
     임베딩 생성에 필요한 전체 활성 VOD 조회.
     is_active=TRUE 조건만 적용 (ct_cl 제한 없음 — 전 장르 임베딩).
@@ -144,14 +152,21 @@ def fetch_all_vods() -> list[dict]:
 # 시리즈 단위 그룹핑
 # ---------------------------------------------------------------------------
 
-def group_by_series(vods: list[dict]) -> dict[tuple, list[dict]]:
+def group_by_series(vods: list) -> dict:
     """
     (normalized_title, ct_cl) 기준으로 시리즈 그룹핑.
+    asset_nm이 없는 row는 full_asset_id를 키로 사용해 단독 처리 (오염 방지).
     반환: {(normalized_title, ct_cl): [vod, vod, ...], ...}
     """
-    groups: dict[tuple, list[dict]] = defaultdict(list)
+    groups = defaultdict(list)
     for vod in vods:
-        key = (normalize_title(vod['asset_nm']), vod['ct_cl'])
+        raw_title = vod.get('asset_nm')
+        if raw_title and raw_title.strip():
+            norm_title = normalize_title(raw_title)
+        else:
+            # 제목 없는 row는 독립 키로 분리 (다른 row와 섞이지 않도록)
+            norm_title = f"__NO_TITLE__:{vod['full_asset_id']}"
+        key = (norm_title, vod.get('ct_cl') or '')
         groups[key].append(vod)
     return groups
 
@@ -160,7 +175,7 @@ def group_by_series(vods: list[dict]) -> dict[tuple, list[dict]]:
 # 배치 저장
 # ---------------------------------------------------------------------------
 
-def save_batch(rows: list[tuple]) -> None:
+def save_batch(rows: list) -> None:
     """
     vod_embedding 테이블에 임베딩 일괄 저장.
     ON CONFLICT DO UPDATE → 기존 임베딩 덮어씀 (재생성 안전).
@@ -205,25 +220,60 @@ def run() -> None:
     total_rows   = len(all_vods)
     logger.info(f"  시리즈 그룹 수: {total_series:,}개 (row {total_rows:,}건 → {total_series:,}번 연산)")
 
-    # 3. 시리즈 단위 임베딩 연산 + 저장
-    series_list = list(series_groups.items())
-    done_series = 0
-    done_rows   = 0
-    pending_rows: list[tuple] = []  # 저장 대기 버퍼
+    # 3. 시리즈 대표 텍스트 수집 (배치 인코딩용)
+    series_list   = list(series_groups.items())   # [(key, [vod, ...]), ...]
+    rep_texts     = []                             # 대표 텍스트 리스트
+    skipped       = 0
 
-    for (norm_title, ct_cl), group_vods in series_list:
-        # 대표 row 선택 → 임베딩 텍스트 구성
-        rep = pick_representative(group_vods)
-        text = build_vod_text(rep)
+    for key, group_vods in series_list:
+        rep  = pick_representative(group_vods)
+        text = build_vod_text(rep).strip()
+        if not text:
+            # 빈 텍스트는 제목이라도 넣어서 최소한의 벡터 생성
+            text = rep.get('asset_nm') or ''
+        if not text:
+            # 제목도 없으면 스킵 로그 남기고 None 표시
+            logger.warning(f"빈 텍스트 스킵 — full_asset_id={rep['full_asset_id']}")
+            rep_texts.append(None)
+            skipped += 1
+        else:
+            rep_texts.append(text)
 
-        # 임베딩 연산 (1건)
-        vec: np.ndarray = model.encode(
-            [text],
-            normalize_embeddings=True,  # L2 정규화 → cosine = dot product
-            show_progress_bar=False,
-        )[0]
-        magnitude = float(np.linalg.norm(vec))
-        vec_str = "[" + ",".join(f"{x:.8f}" for x in vec.tolist()) + "]"
+    if skipped:
+        logger.info(f"  빈 텍스트로 스킵된 시리즈: {skipped:,}개")
+
+    # 4. 배치 인코딩 (ENCODE_BATCH_SIZE 단위)
+    logger.info(f"  배치 인코딩 시작 (배치 크기: {ENCODE_BATCH_SIZE})")
+    valid_indices = [i for i, t in enumerate(rep_texts) if t is not None]
+    valid_texts   = [rep_texts[i] for i in valid_indices]
+
+    # 전체 유효 텍스트를 한 번에 배치 인코딩
+    all_vectors = model.encode(
+        valid_texts,
+        batch_size=ENCODE_BATCH_SIZE,
+        normalize_embeddings=True,   # L2 정규화 → cosine = dot product
+        show_progress_bar=True,
+    )
+    logger.info(f"  인코딩 완료: {len(valid_texts):,}개 시리즈")
+
+    # 5. 인코딩 결과를 시리즈별로 매핑 → DB 저장
+    vec_map = {valid_indices[i]: all_vectors[i] for i in range(len(valid_indices))}
+
+    done_series  = 0
+    done_rows    = 0
+    pending_rows = []
+
+    for idx, (key, group_vods) in enumerate(series_list):
+        if idx not in vec_map:
+            # 빈 텍스트로 스킵된 시리즈
+            done_series += 1
+            done_rows   += len(group_vods)
+            continue
+
+        vec       = vec_map[idx]
+        vec_str   = "[" + ",".join(f"{x:.8f}" for x in vec.tolist()) + "]"
+        # normalize_embeddings=True이면 magnitude는 항상 ~1.0
+        magnitude = 1.0
 
         # 시리즈 내 전체 row에 동일 벡터 부여
         for vod in group_vods:
