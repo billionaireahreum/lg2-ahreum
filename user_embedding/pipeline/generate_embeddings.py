@@ -24,7 +24,6 @@ import re
 from collections import defaultdict
 from datetime import date
 
-import numpy as np
 import psycopg2.extras
 from sentence_transformers import SentenceTransformer
 
@@ -243,6 +242,10 @@ def run() -> None:
         logger.info(f"  빈 텍스트로 스킵된 시리즈: {skipped:,}개")
 
     # 4. 배치 인코딩 (ENCODE_BATCH_SIZE 단위)
+    if not valid_texts:
+        logger.warning("인코딩할 유효 텍스트가 없습니다. 종료합니다.")
+        return
+
     logger.info(f"  배치 인코딩 시작 (배치 크기: {ENCODE_BATCH_SIZE})")
     valid_indices = [i for i, t in enumerate(rep_texts) if t is not None]
     valid_texts   = [rep_texts[i] for i in valid_indices]
@@ -263,7 +266,7 @@ def run() -> None:
     done_rows    = 0
     pending_rows = []
 
-    for idx, (key, group_vods) in enumerate(series_list):
+    for idx, (_, group_vods) in enumerate(series_list):
         if idx not in vec_map:
             # 빈 텍스트로 스킵된 시리즈
             done_series += 1
